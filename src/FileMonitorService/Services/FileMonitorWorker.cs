@@ -7,7 +7,17 @@ namespace FileMonitorService.Services;
 
 /// <summary>
 /// Background worker that sets up FileSystemWatchers on configured paths
-/// and processes file creation/change events to detect file transfers.
+/// and processes file creation events to detect genuine user-initiated file transfers
+/// between local machines and file servers.
+///
+/// Filtering pipeline (applied in order):
+/// 1. Path exclusion  — AppData, browser cache, temp dirs, system dirs
+/// 2. Debounce        — skip duplicate events for the same file
+/// 3. Extension filter — optional whitelist of file extensions
+/// 4. Directory check  — skip directory creation events
+/// 5. File size        — skip zero-byte / tiny files
+/// 6. Process check    — only allow explorer.exe and known copy tools
+/// 7. User check       — skip NT AUTHORITY\SYSTEM and service accounts
 /// </summary>
 public sealed class FileMonitorWorker : BackgroundService
 {
@@ -17,6 +27,7 @@ public sealed class FileMonitorWorker : BackgroundService
     private readonly UserIdentityService _userIdentityService;
     private readonly EventLogService _eventLogService;
     private readonly CsvLogService _csvLogService;
+    private readonly ProcessHelper _processHelper;
     private readonly List<FileSystemWatcher> _watchers = new();
 
     // Debounce dictionary to prevent duplicate events for the same file
@@ -28,7 +39,8 @@ public sealed class FileMonitorWorker : BackgroundService
         PathClassifier pathClassifier,
         UserIdentityService userIdentityService,
         EventLogService eventLogService,
-        CsvLogService csvLogService)
+        CsvLogService csvLogService,
+        ProcessHelper processHelper)
     {
         _logger = logger;
         _settings = settings.Value;
@@ -36,6 +48,7 @@ public sealed class FileMonitorWorker : BackgroundService
         _userIdentityService = userIdentityService;
         _eventLogService = eventLogService;
         _csvLogService = csvLogService;
+        _processHelper = processHelper;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -48,8 +61,10 @@ public sealed class FileMonitorWorker : BackgroundService
         SetupWatchers();
 
         _logger.LogInformation(
-            "Monitoring {LocalCount} local path(s) and {ServerCount} file server path(s)",
-            _settings.LocalPaths.Count, _settings.FileServerPaths.Count);
+            "Monitoring {LocalCount} local path(s) and {ServerCount} file server path(s). " +
+            "Process filtering: {ProcessFilter}",
+            _settings.LocalPaths.Count, _settings.FileServerPaths.Count,
+            _settings.OnlyUserInitiatedCopies ? "ON (explorer.exe only)" : "OFF");
 
         // Keep the service running and periodically clean up the debounce dictionary
         while (!stoppingToken.IsCancellationRequested)
@@ -88,15 +103,12 @@ public sealed class FileMonitorWorker : BackgroundService
             {
                 IncludeSubdirectories = _settings.IncludeSubdirectories,
                 EnableRaisingEvents = true,
-                NotifyFilter = NotifyFilters.FileName
-                             | NotifyFilters.LastWrite
-                             | NotifyFilters.CreationTime
-                             | NotifyFilters.Size
+                // Only watch for new files — not modifications to existing files
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.CreationTime
             };
 
-            watcher.Created += (sender, e) => OnFileEvent(path, e.FullPath, e.Name, WatcherChangeTypes.Created);
-            watcher.Changed += (sender, e) => OnFileEvent(path, e.FullPath, e.Name, WatcherChangeTypes.Changed);
-            watcher.Renamed += (sender, e) => OnFileEvent(path, e.FullPath, e.Name, WatcherChangeTypes.Renamed);
+            // Only listen for Created events — the only reliable indicator of a copy
+            watcher.Created += (sender, e) => OnFileEvent(path, e.FullPath, e.Name);
             watcher.Error += OnWatcherError;
 
             _watchers.Add(watcher);
@@ -108,16 +120,15 @@ public sealed class FileMonitorWorker : BackgroundService
         }
     }
 
-    private void OnFileEvent(string watchedPath, string fullPath, string? fileName, WatcherChangeTypes changeType)
+    private void OnFileEvent(string watchedPath, string fullPath, string? fileName)
     {
         try
         {
-            // Only process Created events to avoid duplicates for the same copy operation.
-            // Changed events are included for large files that trigger multiple write notifications.
-            if (changeType != WatcherChangeTypes.Created && changeType != WatcherChangeTypes.Renamed)
+            // === FILTER 1: Path exclusion (AppData, browser cache, temp dirs, etc.) ===
+            if (_pathClassifier.ShouldExclude(fullPath))
                 return;
 
-            // Debounce: skip if we already processed this file recently
+            // === FILTER 2: Debounce — skip if we already processed this file recently ===
             var debounceKey = fullPath.ToLowerInvariant();
             var now = DateTime.Now;
             if (_recentEvents.TryGetValue(debounceKey, out var lastSeen)
@@ -127,15 +138,15 @@ public sealed class FileMonitorWorker : BackgroundService
             }
             _recentEvents[debounceKey] = now;
 
-            // Check extension filter
+            // === FILTER 3: Extension filter ===
             if (!_pathClassifier.MatchesExtensionFilter(fullPath))
                 return;
 
-            // Skip directories
+            // === FILTER 4: Skip directories ===
             if (Directory.Exists(fullPath) && !File.Exists(fullPath))
                 return;
 
-            // Check minimum file size
+            // === FILTER 5: Minimum file size ===
             long fileSize = 0;
             try
             {
@@ -145,22 +156,43 @@ public sealed class FileMonitorWorker : BackgroundService
             }
             catch
             {
-                // File may still be locked/copying
+                // File may still be locked/being written
             }
 
             if (fileSize < _settings.MinimumFileSizeBytes)
                 return;
 
-            // Classify the direction
+            // === FILTER 6: Process check — is this a user-initiated copy? ===
+            if (_settings.OnlyUserInitiatedCopies)
+            {
+                var (isUserInitiated, procName) = _processHelper.IsUserInitiatedCopy(fullPath);
+                if (!isUserInitiated)
+                {
+                    _logger.LogDebug(
+                        "Skipping non-user file event: {File} (process: {Process})",
+                        fullPath, procName ?? "unknown");
+                    return;
+                }
+            }
+
+            // === CLASSIFY the transfer direction ===
             var direction = _pathClassifier.ClassifyDirection(watchedPath, fullPath);
             if (direction == null)
             {
-                _logger.LogDebug("Could not classify direction for {FilePath} (watched: {WatchedPath})", fullPath, watchedPath);
+                _logger.LogDebug("Could not classify direction for {FilePath}", fullPath);
                 return;
             }
 
-            // Resolve user
+            // === RESOLVE the user ===
             var userName = _userIdentityService.GetFileOwner(fullPath);
+
+            // === FILTER 7: Skip SYSTEM / service account events — not real user copies ===
+            if (userName.StartsWith("NT AUTHORITY\\", StringComparison.OrdinalIgnoreCase)
+                || userName.StartsWith("NT SERVICE\\", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogDebug("Skipping system account event: {User} -> {File}", userName, fullPath);
+                return;
+            }
 
             var transferEvent = new FileTransferEvent
             {
@@ -191,7 +223,6 @@ public sealed class FileMonitorWorker : BackgroundService
         var ex = e.GetException();
         _logger.LogError(ex, "FileSystemWatcher error occurred");
 
-        // Attempt to re-enable the watcher
         if (sender is FileSystemWatcher watcher)
         {
             try
