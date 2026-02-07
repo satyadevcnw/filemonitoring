@@ -45,11 +45,12 @@ public sealed class MonitorSettings
     public List<string> ExcludedFilePatterns { get; set; } = new();
 
     /// <summary>
-    /// If true, only log events where the creating process is a known file manager
-    /// (explorer.exe, robocopy, xcopy, etc.). This eliminates noise from browsers,
-    /// editors, and system processes. Recommended: true.
+    /// If true, uses the Windows Restart Manager API to check which process created
+    /// the file and only allows known file managers (explorer.exe, robocopy, etc.).
+    /// Recommended: false. The FileServerVerifier provides better filtering without
+    /// the issues caused by the Restart Manager (e.g., blocking svchost/SMB copies).
     /// </summary>
-    public bool OnlyUserInitiatedCopies { get; set; } = true;
+    public bool OnlyUserInitiatedCopies { get; set; } = false;
 
     /// <summary>
     /// Path to write CSV log files.

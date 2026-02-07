@@ -490,28 +490,24 @@ public sealed class FileMonitorWorker : BackgroundService
         if (Directory.Exists(fullPath) && !File.Exists(fullPath))
             return;
 
-        // File size
+        // File size — retry up to 3 times with a short delay because the
+        // Created event fires the instant the file is created but BEFORE
+        // data is written (especially for network copies via SMB).
         long fileSize = 0;
-        try
+        for (int attempt = 0; attempt < 3; attempt++)
         {
-            var fileInfo = new FileInfo(fullPath);
-            if (fileInfo.Exists)
-                fileSize = fileInfo.Length;
-        }
-        catch { }
-
-        if (fileSize < _settings.MinimumFileSizeBytes)
-            return;
-
-        // Process check
-        if (_settings.OnlyUserInitiatedCopies)
-        {
-            var (isUserInitiated, procName) = _processHelper.IsUserInitiatedCopy(fullPath);
-            if (!isUserInitiated)
+            try
             {
-                _logger.LogDebug("Skipping non-user event: {File} (process: {Process})", fullPath, procName ?? "unknown");
-                return;
+                var fileInfo = new FileInfo(fullPath);
+                if (fileInfo.Exists)
+                    fileSize = fileInfo.Length;
+                if (fileSize > 0)
+                    break;
             }
+            catch { }
+
+            // Wait briefly for the file data to be flushed
+            Thread.Sleep(500);
         }
 
         // Direction
@@ -523,6 +519,7 @@ public sealed class FileMonitorWorker : BackgroundService
         // A file appeared on a local drive. That does NOT mean it came from the server.
         // It could be a build output, an app-generated file, or a local-to-local copy.
         // VERIFY: only log if the same filename actually exists on the file server.
+        // This replaces the old process check (which blocked svchost/SMB copies).
         if (direction == TransferDirection.FileServerToLocal)
         {
             var name = fileName ?? Path.GetFileName(fullPath);
