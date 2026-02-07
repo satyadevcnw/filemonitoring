@@ -26,6 +26,7 @@ public sealed class FileMonitorWorker : BackgroundService
     private readonly EventLogService _eventLogService;
     private readonly CsvLogService _csvLogService;
     private readonly ProcessHelper _processHelper;
+    private readonly FileServerVerifier _fileServerVerifier;
 
     // All content watchers, keyed by their watched path (for dynamic add/remove)
     private readonly ConcurrentDictionary<string, FileSystemWatcher> _contentWatchers = new(StringComparer.OrdinalIgnoreCase);
@@ -84,7 +85,8 @@ public sealed class FileMonitorWorker : BackgroundService
         UserIdentityService userIdentityService,
         EventLogService eventLogService,
         CsvLogService csvLogService,
-        ProcessHelper processHelper)
+        ProcessHelper processHelper,
+        FileServerVerifier fileServerVerifier)
     {
         _logger = logger;
         _settings = settings.Value;
@@ -93,6 +95,7 @@ public sealed class FileMonitorWorker : BackgroundService
         _eventLogService = eventLogService;
         _csvLogService = csvLogService;
         _processHelper = processHelper;
+        _fileServerVerifier = fileServerVerifier;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -101,6 +104,14 @@ public sealed class FileMonitorWorker : BackgroundService
 
         _eventLogService.EnsureEventLogSource();
         _csvLogService.EnsureLogDirectory();
+
+        // Build an index of all filenames on the file server so we can verify
+        // whether files appearing locally actually came from the server
+        _logger.LogInformation("Building file server index...");
+        _fileServerVerifier.BuildInitialIndex();
+
+        // Refresh the index periodically in the background
+        _ = Task.Run(() => _fileServerVerifier.StartPeriodicRefreshAsync(stoppingToken), stoppingToken);
 
         SetupWatchers();
 
@@ -355,7 +366,19 @@ public sealed class FileMonitorWorker : BackgroundService
                 InternalBufferSize = 65536
             };
 
-            watcher.Created += (sender, e) => EnqueueEvent(path, e.FullPath, e.Name);
+            watcher.Created += (sender, e) =>
+            {
+                // Keep the server file index up to date
+                var name = e.Name != null ? Path.GetFileName(e.Name) : null;
+                if (name != null) _fileServerVerifier.AddToIndex(name);
+                EnqueueEvent(path, e.FullPath, e.Name);
+            };
+            watcher.Deleted += (sender, e) =>
+            {
+                // Remove from index when files are deleted from server
+                var name = e.Name != null ? Path.GetFileName(e.Name) : null;
+                if (name != null) _fileServerVerifier.RemoveFromIndex(name);
+            };
             watcher.Error += OnWatcherError;
 
             _serverWatchers.Add(watcher);
@@ -495,6 +518,22 @@ public sealed class FileMonitorWorker : BackgroundService
         var direction = _pathClassifier.ClassifyDirection(watchedPath, fullPath);
         if (direction == null)
             return;
+
+        // === KEY VERIFICATION for "File Server to Local" ===
+        // A file appeared on a local drive. That does NOT mean it came from the server.
+        // It could be a build output, an app-generated file, or a local-to-local copy.
+        // VERIFY: only log if the same filename actually exists on the file server.
+        if (direction == TransferDirection.FileServerToLocal)
+        {
+            var name = fileName ?? Path.GetFileName(fullPath);
+            if (!_fileServerVerifier.ExistsOnFileServer(name))
+            {
+                _logger.LogDebug(
+                    "Skipping local event — file '{FileName}' not found on any file server",
+                    name);
+                return;
+            }
+        }
 
         // User
         var userName = _userIdentityService.GetFileOwner(fullPath);
