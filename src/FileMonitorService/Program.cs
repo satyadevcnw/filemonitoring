@@ -30,6 +30,7 @@ try
     builder.Services.AddSingleton<CsvLogService>();
     builder.Services.AddSingleton<ProcessHelper>();
     builder.Services.AddSingleton<FileServerVerifier>();
+    builder.Services.AddSingleton<NetworkShareConnector>();
 
     // Register the background worker
     builder.Services.AddHostedService<FileMonitorWorker>();

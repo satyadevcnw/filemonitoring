@@ -21,6 +21,20 @@ public sealed class MonitorSettings
     public List<string> FileServerPaths { get; set; } = new();
 
     /// <summary>
+    /// Domain\Username or Username to authenticate to file server shares.
+    /// Required when the service runs as LocalSystem (default for Windows Services).
+    /// Example: "CONTOSO\svc_filemonitor" or "administrator"
+    /// If empty, the service relies on the service account's own credentials.
+    /// </summary>
+    public string FileServerUsername { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Password for the file server account. Required if FileServerUsername is set.
+    /// For production, consider using Windows Credential Manager or DPAPI instead.
+    /// </summary>
+    public string FileServerPassword { get; set; } = string.Empty;
+
+    /// <summary>
     /// File extensions to monitor. Empty list means all files.
     /// Example: [".docx", ".xlsx", ".pdf", ".txt"]
     /// </summary>

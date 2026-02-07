@@ -27,6 +27,7 @@ public sealed class FileMonitorWorker : BackgroundService
     private readonly CsvLogService _csvLogService;
     private readonly ProcessHelper _processHelper;
     private readonly FileServerVerifier _fileServerVerifier;
+    private readonly NetworkShareConnector _networkShareConnector;
 
     // All content watchers, keyed by their watched path (for dynamic add/remove)
     private readonly ConcurrentDictionary<string, FileSystemWatcher> _contentWatchers = new(StringComparer.OrdinalIgnoreCase);
@@ -86,7 +87,8 @@ public sealed class FileMonitorWorker : BackgroundService
         EventLogService eventLogService,
         CsvLogService csvLogService,
         ProcessHelper processHelper,
-        FileServerVerifier fileServerVerifier)
+        FileServerVerifier fileServerVerifier,
+        NetworkShareConnector networkShareConnector)
     {
         _logger = logger;
         _settings = settings.Value;
@@ -96,6 +98,7 @@ public sealed class FileMonitorWorker : BackgroundService
         _csvLogService = csvLogService;
         _processHelper = processHelper;
         _fileServerVerifier = fileServerVerifier;
+        _networkShareConnector = networkShareConnector;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -104,6 +107,12 @@ public sealed class FileMonitorWorker : BackgroundService
 
         _eventLogService.EnsureEventLogSource();
         _csvLogService.EnsureLogDirectory();
+
+        // Connect to file server shares using configured credentials.
+        // This is required because the service runs as LocalSystem which
+        // has no network identity — it can't access \\server\share without
+        // explicit authentication.
+        _networkShareConnector.ConnectAll();
 
         // Build an index of all filenames on the file server so we can verify
         // whether files appearing locally actually came from the server
